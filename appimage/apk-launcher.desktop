@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Rocket League Sideswipe
+GenericName=Car soccer game
+Comment=Rocket League Sideswipe on Linux (rlss-linux)
+Exec=apk-launcher
+Icon=apk-launcher
+Terminal=false
+Categories=Game;SportsGame;
+Keywords=rocket;league;sideswipe;rlss;car;soccer;
+StartupWMClass=apk-launcher

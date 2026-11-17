@@ -1,0 +1,226 @@
+#!/bin/bash
+# AppRun for RLSS Linux (Rocket League Sideswipe): picks the launcher binary that matches the native
+# code inside the APK (x86_64 / x86 on PCs, arm64-v8a / armeabi-v7a on ARM).
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-$HERE}"
+BIN="$HERE/usr/bin"
+
+have_tty() { [ -t 2 ]; }
+
+show_error() {
+    echo "RLSS Linux: $1" >&2
+    if ! have_tty; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --error --title="RLSS Linux" --width=480 --text="$1" 2>/dev/null
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "RLSS Linux" --error "$1" 2>/dev/null
+        elif command -v notify-send >/dev/null 2>&1; then
+            notify-send "RLSS Linux" "$1"
+        fi
+    fi
+}
+
+pick_apk() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --file-selection --title="Select the Rocket League Sideswipe APK" --file-filter="Android apps | *.apk *.APK" 2>/dev/null
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "Select the Rocket League Sideswipe APK" --getopenfilename "$HOME" "*.apk *.APK|Android apps" 2>/dev/null
+    fi
+}
+
+# Host binary used for inspection (always runnable)
+case "$(uname -m)" in
+    x86_64|amd64) NATIVE=x86_64; COMPAT=x86; COMPAT_LOADER=/lib/ld-linux.so.2 ;;
+    aarch64|arm64) NATIVE=aarch64; COMPAT=armhf; COMPAT_LOADER=/lib/ld-linux-armhf.so.3 ;;
+    armv7l|armv8l) NATIVE=armhf; COMPAT=; COMPAT_LOADER= ;;
+    i?86) NATIVE=x86; COMPAT=; COMPAT_LOADER= ;;
+    *) show_error "Unsupported CPU architecture $(uname -m)"; exit 1 ;;
+esac
+INSPECT="$BIN/apk-launcher-$NATIVE"
+
+# --- Which game APK to run ---------------------------------------------------
+# 1. built into the AppImage (an APK was in apk/ at build time)
+# 2. $RLSS_APK
+# 3. the APK chosen on an earlier start (~/.config/rlss-linux/apk-path)
+# 4. the newest *.apk next to the AppImage
+# 5. ask with a file picker, and remember the choice
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/rlss-linux"
+find_game_apk() {
+    local p
+    if [ -f "$HERE/usr/share/apk-launcher/app.apk" ]; then echo "$HERE/usr/share/apk-launcher/app.apk"; return; fi
+    if [ -n "${RLSS_APK:-}" ] && [ -f "$RLSS_APK" ]; then echo "$RLSS_APK"; return; fi
+    if [ -f "$CONF/apk-path" ]; then
+        p="$(cat "$CONF/apk-path")"
+        [ -f "$p" ] && { echo "$p"; return; }
+    fi
+    p="$(ls -t "$(dirname "${APPIMAGE:-$HERE}")"/*.apk 2>/dev/null | head -1)"
+    [ -n "$p" ] && { echo "$p"; return; }
+    p="$(pick_apk)"
+    if [ -n "$p" ] && [ -f "$p" ]; then
+        mkdir -p "$CONF" && printf '%s\n' "$p" > "$CONF/apk-path"
+        echo "$p"
+    fi
+}
+
+has_apk_arg=0
+for a in "$@"; do case "$a" in *.apk|*.APK) has_apk_arg=1 ;; esac; done
+case "${1:-}" in info|abis|extract|--help|--version|--deliver-uri|--gamepad-bridge) has_apk_arg=1 ;; esac
+if [ $has_apk_arg = 0 ]; then
+    GAME="$(find_game_apk)"
+    if [ -z "$GAME" ]; then
+        show_error "Rocket League Sideswipe APK not found.
+Put the APK next to this AppImage, or start it with RLSS_APK=/path/to/game.apk"
+        exit 1
+    fi
+    set -- "$GAME" "$@"
+fi
+
+# Commands that only inspect the APK run with the native binary
+case "$1" in
+    info|abis|extract|--help|--version|--deliver-uri) exec "$INSPECT" "$@" ;;
+esac
+
+# Find the APK argument
+APK=""
+for a in "$@"; do
+    case "$a" in
+        *.apk|*.APK|*.apks) APK="$a"; break ;;
+    esac
+done
+if [ -z "$APK" ]; then
+    for a in "$@"; do [ -f "$a" ] && APK="$a" && break; done
+fi
+if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+    show_error "No APK file given (usage: RLSS-Linux.AppImage game.apk)"
+    exit 1
+fi
+
+ABIS="$("$INSPECT" abis "$APK" 2>/dev/null)"
+has_abi() { printf '%s\n' "$ABIS" | grep -qx "$1"; }
+
+CHOSEN=""
+case "$NATIVE" in
+    x86_64)
+        if has_abi x86_64; then CHOSEN=x86_64
+        elif has_abi x86; then CHOSEN=x86
+        fi ;;
+    aarch64)
+        if has_abi arm64-v8a; then CHOSEN=aarch64
+        elif has_abi armeabi-v7a || has_abi armeabi; then CHOSEN=armhf
+        fi ;;
+    armhf)
+        if has_abi armeabi-v7a || has_abi armeabi; then CHOSEN=armhf; fi ;;
+    x86)
+        if has_abi x86; then CHOSEN=x86; fi ;;
+esac
+
+# --- ARM translation layer (x86 PCs): run the ARM launcher under qemu-user ---
+TRANS="$HERE/usr/lib/arm-translation"
+arm_variant() {
+    if has_abi arm64-v8a && [ -x "$BIN/apk-launcher-aarch64" ] && [ -d "$TRANS/aarch64" ]; then echo aarch64
+    elif { has_abi armeabi-v7a || has_abi armeabi; } && [ -x "$BIN/apk-launcher-armhf" ] && [ -d "$TRANS/armhf" ]; then echo armhf
+    fi
+}
+if [ "$NATIVE" = x86_64 ] && { [ -z "$CHOSEN" ] || [ "${APK_LAUNCHER_PREFER_ARM:-0}" = 1 ]; }; then
+    VARIANT="$(arm_variant)"
+    if [ -n "$VARIANT" ]; then
+        QEMU="$TRANS/qemu-aarch64"
+        [ "$VARIANT" = armhf ] && QEMU="$TRANS/qemu-arm"
+        echo "RLSS Linux: $(basename "$APK") has only ARM code, running it through the ARM translation layer ($VARIANT, qemu). CPU code is emulated, so expect lower speed." >&2
+        # The ARM side gets its own libraries from the bundled runtime: drop
+        # host library paths. Host GPU drivers are x86 code, so ARM code uses
+        # Mesa's "virpipe" driver, which streams GL work to a native
+        # virglrenderer server that draws with the real GPU.
+        HOST_LD_PATH="$TRANS/host${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        # Controllers: the emulated process cannot open them (evdev/hidraw
+        # ioctls), so the native launcher reads them and forwards the events.
+        GSOCK="${XDG_RUNTIME_DIR:-/tmp}/apk-launcher-gamepad-$$.sock"
+        LD_LIBRARY_PATH="$HERE/usr/lib/x86_64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$BIN/apk-launcher-x86_64" --gamepad-bridge "$GSOCK" >/dev/null 2>&1 &
+        export APKL_GAMEPAD_BRIDGE="$GSOCK"
+        # QEMU: bigger translated-code cache (the game libraries are huge) and
+        # the cheap pointer-authentication emulation
+        export QEMU_TB_SIZE="${QEMU_TB_SIZE:-2048}"
+        export QEMU_CPU="${QEMU_CPU:-max,pauth-impdef=on}"
+        unset LD_LIBRARY_PATH LD_PRELOAD
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+        export LP_NUM_THREADS="${LP_NUM_THREADS:-$(nproc 2>/dev/null || echo 4)}"
+        GALLIUM_DRIVER=llvmpipe
+        if [ "${APK_LAUNCHER_ARM_GPU:-1}" = 1 ]; then
+            # Prefer the system's virglrenderer (matches its drivers), else the bundled one
+            VIRGL="$(command -v virgl_test_server 2>/dev/null || true)"
+            [ "${APK_LAUNCHER_VIRGL:-}" = bundled ] && VIRGL=""
+            VIRGL_LD="${HOST_LD_PATH#"$TRANS/host"}"; VIRGL_LD="${VIRGL_LD#:}"
+            if [ -z "$VIRGL" ]; then VIRGL="$TRANS/host/virgl_test_server"; VIRGL_LD="$HOST_LD_PATH"; fi
+            SOCK="${XDG_RUNTIME_DIR:-/tmp}/apk-launcher-vtest-$$.sock"
+            rm -f "$SOCK"
+            # virglrenderer >= 0.11 takes --socket-path; older ones always use /tmp/.virgl_test
+            if "$VIRGL" --usage-probe 2>&1 | grep -q -- --socket-path; then
+                SOCKARG=(--socket-path "$SOCK")
+            else
+                SOCK=/tmp/.virgl_test; SOCKARG=()
+                # stale socket from a crashed run (no server listening any more)
+                pgrep -f virgl_test_server >/dev/null 2>&1 || rm -f "$SOCK"
+            fi
+            for mode in --use-egl-surfaceless ""; do
+                # the server is a normal host program: keep the ARM side's GL settings away from it
+                env -u LIBGL_ALWAYS_SOFTWARE -u __EGL_VENDOR_LIBRARY_FILENAMES -u GALLIUM_DRIVER -u LP_NUM_THREADS \
+                    LD_LIBRARY_PATH="$VIRGL_LD" "$VIRGL" --multi-clients $mode "${SOCKARG[@]}" >/dev/null 2>&1 &
+                VPID=$!
+                for _ in $(seq 40); do [ -S "$SOCK" ] && break; kill -0 "$VPID" 2>/dev/null || break; sleep 0.05; done
+                [ -S "$SOCK" ] && break
+                kill "$VPID" 2>/dev/null; VPID=""
+                # another APK Launcher instance already serves the fixed socket
+                [ -S "$SOCK" ] && [ "$SOCK" = /tmp/.virgl_test ] && VPID=shared && break
+            done
+            if [ -n "$VPID" ]; then
+                GALLIUM_DRIVER=virpipe
+                export VTEST_SOCKET_NAME="$SOCK"
+                echo "RLSS Linux: ARM GPU acceleration on (virgl)" >&2
+            else
+                echo "RLSS Linux: could not start the virgl GPU server, using software rendering" >&2
+            fi
+        fi
+        export GALLIUM_DRIVER
+        if [ -n "${VPID:-}" ]; then
+            [ "$VPID" != shared ] && trap 'pkill -P "$VPID" 2>/dev/null; kill "$VPID" 2>/dev/null; rm -f "$SOCK"' EXIT INT TERM
+            "$QEMU" -L "$TRANS/$VARIANT" "$BIN/apk-launcher-$VARIANT" "$@"
+            exit $?
+        fi
+        exec "$QEMU" -L "$TRANS/$VARIANT" "$BIN/apk-launcher-$VARIANT" "$@"
+    fi
+fi
+
+if [ -z "$CHOSEN" ]; then
+    if [ -z "$ABIS" ]; then
+        show_error "$(basename "$APK") has no native code (it is a Java/Kotlin app). APK Launcher runs native Android apps (NDK / NativeActivity and Unreal Engine 4 games); apps written only in Java/Kotlin need an Android runtime it does not include."
+    else
+        list="$(printf '%s ' $ABIS)"
+        msg="$(basename "$APK") only contains native code for: $list
+This AppImage runs on $(uname -m) and can launch:"
+        case "$NATIVE" in
+            x86_64|x86) msg="$msg x86_64 and x86 APKs (this build has no ARM translation layer, use the full x86_64 AppImage for ARM apps)." ;;
+            *) msg="$msg arm64-v8a and armeabi-v7a APKs. x86-only APKs need the x86_64 AppImage on a PC." ;;
+        esac
+        show_error "$msg"
+    fi
+    exit 3
+fi
+
+TARGET="$BIN/apk-launcher-$CHOSEN"
+if [ ! -x "$TARGET" ]; then
+    show_error "This AppImage was built without the $CHOSEN launcher."
+    exit 3
+fi
+if [ "$CHOSEN" = "$COMPAT" ] && [ -n "$COMPAT_LOADER" ] && [ ! -e "$COMPAT_LOADER" ]; then
+    case "$COMPAT" in
+        x86) hint="sudo apt install libc6-i386 libgl1:i386 libegl1:i386  (Debian/Ubuntu)  or  sudo pacman -S lib32-glibc lib32-mesa  (Arch)" ;;
+        armhf) hint="sudo dpkg --add-architecture armhf && sudo apt install libc6:armhf libegl1:armhf libgles2:armhf" ;;
+    esac
+    show_error "$(basename "$APK") is a 32-bit ($COMPAT) app. Running it needs the 32-bit system libraries: $hint"
+    exit 3
+fi
+
+LIBDIR="$HERE/usr/lib/$CHOSEN"
+export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$TARGET" "$@"

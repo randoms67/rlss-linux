@@ -1,0 +1,39 @@
+# Build output
+build/
+build-*/
+dist/
+*.AppImage
+*.o
+*.a
+*.so
+
+# Game files (large, and not ours to redistribute)
+*.apk
+*.apks
+*.obb
+*.xapk
+
+# Crash dumps (qemu writes these next to where the game was started)
+*.core
+core
+core.*
+vgcore.*
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local tool state
+.claude/
+.cache/
+compile_commands.json

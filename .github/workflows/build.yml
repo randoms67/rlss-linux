@@ -1,0 +1,94 @@
+name: Build RLSS Linux
+
+# - push to main/master: builds both AppImages and updates the rolling
+#   "continuous" pre-release
+# - push a tag like v1.0.0: builds and publishes a normal release for it
+# - pull requests / manual runs: build only (files are kept as workflow artifacts)
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # mcpelauncher-manifest revision the code and patches/ are made for
+  MANIFEST_REPO: https://github.com/minecraft-linux/mcpelauncher-manifest
+  MANIFEST_REF: fb58aa2dbd966573844fc3fe53dadcddb6719009
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          # the ARM runtime and both AppDirs need ~10 GB
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null || true
+          df -h /
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check out mcpelauncher-manifest (next to the project)
+        run: |
+          dest="$(dirname "$GITHUB_WORKSPACE")/mcpelauncher-manifest"
+          git clone --filter=blob:none "$MANIFEST_REPO" "$dest"
+          git -C "$dest" checkout --quiet "$MANIFEST_REF"
+          git -C "$dest" submodule update --init --recursive --jobs 8
+
+      - name: Cache ARM runtime and QEMU
+        uses: actions/cache@v4
+        with:
+          path: |
+            build-appimage/arm-runtime
+            build-appimage/qemu
+          key: arm-runtime-${{ hashFiles('scripts/container-build.sh', 'scripts/build-appimage.sh') }}
+
+      - name: Build AppImages (aarch64 + x86_64)
+        run: scripts/build-appimage.sh all
+
+      - name: List results
+        run: |
+          ls -la dist
+          sha256sum dist/*.AppImage | tee dist/SHA256SUMS.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimages
+          path: |
+            dist/*.AppImage
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish continuous pre-release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete continuous --yes --cleanup-tag || true
+          gh release create continuous dist/*.AppImage dist/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Continuous build" \
+            --notes "Automatic build of ${GITHUB_SHA::7}. The AppImage does not contain the game: put the Rocket League Sideswipe APK next to it, or pick it on first start."
+
+      - name: Publish tagged release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.AppImage dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.AppImage dist/SHA256SUMS.txt \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi

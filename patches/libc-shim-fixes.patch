@@ -1,0 +1,219 @@
+diff --git a/src/common.cpp b/src/common.cpp
+index 82196aa..08ba277 100644
+--- a/src/common.cpp
++++ b/src/common.cpp
+@@ -138,6 +138,17 @@ clockid_t bionic::to_host_clock_type(bionic::clock_type type) {
+     switch (type) {
+         case clock_type::REALTIME: return CLOCK_REALTIME;
+         case clock_type::MONOTONIC: return CLOCK_MONOTONIC;
++        case clock_type::PROCESS_CPUTIME: return CLOCK_PROCESS_CPUTIME_ID;
++        case clock_type::THREAD_CPUTIME: return CLOCK_THREAD_CPUTIME_ID;
++#ifdef __linux__
++        case clock_type::MONOTONIC_RAW: return CLOCK_MONOTONIC_RAW;
++        case clock_type::REALTIME_COARSE: return CLOCK_REALTIME_COARSE;
++        case clock_type::MONOTONIC_COARSE: return CLOCK_MONOTONIC_COARSE;
++#else
++        case clock_type::MONOTONIC_RAW: return CLOCK_MONOTONIC;
++        case clock_type::REALTIME_COARSE: return CLOCK_REALTIME;
++        case clock_type::MONOTONIC_COARSE: return CLOCK_MONOTONIC;
++#endif
+ #ifdef __APPLE__
+         case clock_type::BOOTTIME: return CLOCK_MONOTONIC;
+ #else
+diff --git a/src/common.h b/src/common.h
+index 86788e8..ed04919 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -16,6 +16,11 @@ namespace shim {
+         enum class clock_type : uint32_t {
+             REALTIME = 0,
+             MONOTONIC = 1,
++            PROCESS_CPUTIME = 2,
++            THREAD_CPUTIME = 3,
++            MONOTONIC_RAW = 4,
++            REALTIME_COARSE = 5,
++            MONOTONIC_COARSE = 6,
+             BOOTTIME = 7
+         };
+ 
+diff --git a/src/file_misc.cpp b/src/file_misc.cpp
+index a8c9250..aa76f15 100644
+--- a/src/file_misc.cpp
++++ b/src/file_misc.cpp
+@@ -38,6 +38,16 @@ int bionic::to_host_file_status_flags(bionic::file_status_flags flags) {
+ 
+ bionic::file_status_flags bionic::from_host_file_status_flags(int flags) {
+     using flag = file_status_flags;
++    // O_LARGEFILE is reported by fcntl(F_GETFL) on 64-bit ARM hosts (and
++    // x86_64 kernels); bionic has no use for it, so drop it instead of aborting
++#ifdef O_LARGEFILE
++    flags &= ~O_LARGEFILE;
++#endif
++#if defined(__aarch64__) || defined(__arm__)
++    // glibc defines O_LARGEFILE as 0 on aarch64, but the kernel (and qemu-user)
++    // still report the real ARM value 0400000
++    flags &= ~0x20000;
++#endif
+     if (((uint32_t) flags & (~(uint32_t) flag::KNOWN_FLAGS)) != 0)
+         handle_runtime_error("Unsupported fd flag used %d", flags);
+ 
+diff --git a/src/network.cpp b/src/network.cpp
+index e744d1e..803dab6 100644
+--- a/src/network.cpp
++++ b/src/network.cpp
+@@ -102,7 +102,7 @@ bionic::ipproto bionic::from_host_ipproto(int proto) {
+         case IPPROTO_TCP: return ipproto::TCP;
+         case IPPROTO_UDP: return ipproto::UDP;
+         case IPPROTO_IPV6: return ipproto::IPV6;
+-        default: handle_runtime_error("Unknown ipproto %d", proto);
++        default: return (ipproto) proto; // IP protocol numbers are the same on every OS (e.g. ICMP=1)
+     }
+ }
+ 
+@@ -112,7 +112,7 @@ int bionic::to_host_ipproto(bionic::ipproto proto) {
+         case ipproto::TCP: return IPPROTO_TCP;
+         case ipproto::UDP: return IPPROTO_UDP;
+         case ipproto::IPV6: return IPPROTO_IPV6;
+-        default: handle_runtime_error("Unknown ipproto %d", (int)proto);
++        default: return (int) proto; // IP protocol numbers are the same on every OS (e.g. ICMP=1)
+     }
+ }
+ 
+diff --git a/src/semaphore.cpp b/src/semaphore.cpp
+index 2650131..172a1dc 100644
+--- a/src/semaphore.cpp
++++ b/src/semaphore.cpp
+@@ -18,12 +18,104 @@ using namespace shim;
+ 
+ #ifndef __APPLE__
+ 
++// Bionic's sem_t is { unsigned int count; int reserved[3]; } and only 4 byte
++// aligned. glibc's semaphore uses 64-bit atomics on the first 8 bytes, which
++// need 8 byte alignment: running glibc's sem_* on the app's sem_t raises
++// SIGBUS (misaligned exclusive access) on ARM hosts. Implement the semaphore
++// on the 32-bit count with futexes instead, the same way bionic does.
++#include <atomic>
++#include <climits>
++#include <linux/futex.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++namespace {
++
++std::atomic<unsigned int> *sem_count(void *sem) {
++    return reinterpret_cast<std::atomic<unsigned int> *>(sem);
++}
++
++int sem_fail(int err) {
++    errno = err;
++    bionic::update_errno();
++    return -1;
++}
++
++bool sem_try_decrement(void *sem) {
++    auto c = sem_count(sem);
++    unsigned int v = c->load(std::memory_order_relaxed);
++    while (v > 0) {
++        if (c->compare_exchange_weak(v, v - 1, std::memory_order_acquire, std::memory_order_relaxed))
++            return true;
++    }
++    return false;
++}
++
++// abs_timeout: absolute time on CLOCK_REALTIME (realtime) or CLOCK_MONOTONIC, nullptr = forever
++int sem_wait_impl(void *sem, const struct timespec *abs_timeout, bool realtime) {
++    if (abs_timeout && (abs_timeout->tv_nsec < 0 || abs_timeout->tv_nsec >= 1000000000))
++        return sem_fail(EINVAL);
++    while (true) {
++        if (sem_try_decrement(sem))
++            return 0;
++        int op = FUTEX_WAIT_BITSET | (realtime && abs_timeout ? FUTEX_CLOCK_REALTIME : 0);
++        long r = syscall(SYS_futex, sem, op, 0u, abs_timeout, nullptr, FUTEX_BITSET_MATCH_ANY);
++        if (r == -1 && errno == ETIMEDOUT)
++            return sem_fail(ETIMEDOUT);
++        // woken up, value changed (EAGAIN) or interrupted (EINTR): try again
++    }
++}
++
++int sem_post_impl(void *sem) {
++    auto c = sem_count(sem);
++    unsigned int v = c->load(std::memory_order_relaxed);
++    do {
++        if (v == (unsigned int) INT_MAX)
++            return sem_fail(EOVERFLOW);
++    } while (!c->compare_exchange_weak(v, v + 1, std::memory_order_release, std::memory_order_relaxed));
++    syscall(SYS_futex, sem, FUTEX_WAKE, 1, nullptr, nullptr, 0);
++    return 0;
++}
++
++int sem_wait_shim(void *sem) {
++    return sem_wait_impl(sem, nullptr, true);
++}
++
++int sem_trywait_shim(void *sem) {
++    return sem_try_decrement(sem) ? 0 : sem_fail(EAGAIN);
++}
++
++int sem_timedwait_shim(void *sem, const struct timespec *abs_timeout) {
++    return sem_wait_impl(sem, abs_timeout, true);
++}
++
++int sem_timedwait_monotonic_np_shim(void *sem, const struct timespec *abs_timeout) {
++    return sem_wait_impl(sem, abs_timeout, false);
++}
++
++int sem_clockwait_shim(void *sem, int clock, const struct timespec *abs_timeout) {
++    // bionic clock ids 0 = REALTIME, 1 = MONOTONIC (same as Linux)
++    if (clock != 0 && clock != 1)
++        return sem_fail(EINVAL);
++    return sem_wait_impl(sem, abs_timeout, clock == 0);
++}
++
++int sem_getvalue_shim(void *sem, int *value) {
++    *value = (int) sem_count(sem)->load(std::memory_order_relaxed);
++    return 0;
++}
++
++}
++
+ int shim::sem_init(sem_t *sem, int pshared, unsigned int value) {
+-    return detail::make_c_wrapped_via_resolver<sem_t_resolver, int, unsigned int>(sem, ::sem_init, pshared, value);
++    if (value > (unsigned int) INT_MAX)
++        return sem_fail(EINVAL);
++    sem_count(sem)->store(value, std::memory_order_relaxed);
++    return 0;
+ }
+ 
+ int shim::sem_destroy(sem_t *sem) {
+-    return detail::destroy_c_wrapped_via_resolver<sem_t_resolver>(sem, ::sem_destroy);
++    return 0;
+ }
+ 
+ #else
+@@ -95,6 +187,19 @@ int shim::sem_timedwait(host_sem_t *sem, const struct timespec *abs_timeout) {
+ #endif
+ 
+ void shim::add_sem_shimmed_symbols(std::vector<shim::shimmed_symbol> &list) {
++#ifndef __APPLE__
++    list.insert(list.end(), {
++        {"sem_init", sem_init},
++        {"sem_destroy", sem_destroy},
++        {"sem_wait", sem_wait_shim},
++        {"sem_trywait", sem_trywait_shim},
++        {"sem_timedwait", sem_timedwait_shim},
++        {"sem_timedwait_monotonic_np", sem_timedwait_monotonic_np_shim},
++        {"sem_clockwait", sem_clockwait_shim},
++        {"sem_post", sem_post_impl},
++        {"sem_getvalue", sem_getvalue_shim},
++    });
++#else
+     list.insert(list.end(), {
+         {"sem_init", sem_init},
+         {"sem_destroy", sem_destroy},
+@@ -102,4 +207,5 @@ void shim::add_sem_shimmed_symbols(std::vector<shim::shimmed_symbol> &list) {
+         {"sem_timedwait", &detail::arg_rewrite_helper<int (::sem_t *, const struct timespec *)>::rewrite<sem_timedwait>},
+         {"sem_post", &detail::arg_rewrite_helper<int (::sem_t *)>::rewrite<sem_post>},
+     });
++#endif
+ }
+\ No newline at end of file
